@@ -11,7 +11,6 @@ Asztrofotós / képes külső tároló audit script:
 - progress bar és verbose mód
 - SQLite állapot/cache adatbázis a gyorsabb újrafuttatáshoz és félbehagyott hash-elés
   folytatásához
-- opcionális hard linkes duplikátum-csere naplózással
 """
 
 from __future__ import annotations
@@ -23,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import sqlite3
 import sys
 import time
@@ -33,9 +33,16 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 
-SCRIPT_VERSION = "3.0"
+SCRIPT_VERSION = "4.0"
 DEFAULT_HARDLINK_DIR_NAMES = ["dark", "darks", "bias", "biases", "flat", "flats"]
 DEFAULT_CANONICAL_PREFER_PATHS = ["Astro/calibration_library"]
+DEFAULT_EXCLUDED_DIR_NAMES = [".spotlight-v100", ".fseventsd", ".trashes", ".temporaryitems", ".documentrevisions-v100", "system volume information", "$recycle.bin"]
+DEFAULT_PACKAGE_SUFFIXES = [".lrlibrary", ".lrdata", ".fcpbundle", ".photoslibrary", ".photolibrary", ".aplibrary", ".app"]
+DEFAULT_DIR_SUMMARY_DEPTHS = [1, 2, 3]
+DEFAULT_REPORT_TOP_N = 25
+ASTRO_RAW_EXTS = {".fit", ".fits", ".fts", ".xisf", ".cr2", ".cr3", ".nef", ".arw", ".dng", ".raf", ".orf", ".rw2"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".mkv", ".avi", ".mts", ".m2ts"}
 
 
 SAFE_DELETE_NAME_PATTERNS = [
@@ -50,7 +57,7 @@ SAFE_DELETE_NAME_PATTERNS = [
     re.compile(r"^\.?_.*\.old$", re.I),
     re.compile(r"^\.?_.*\.swp$", re.I),
     re.compile(r"^\.?_.*~$", re.I),
-    re.compile(r"^\._.*$", re.I),
+    re.compile(r"^\._.*$", re.I),  # macOS AppleDouble metadata files
 ]
 
 SAFE_DELETE_EXTS = {
@@ -117,6 +124,14 @@ class Finding:
 class ExclusionRules:
     excluded_paths: List[Path]
     excluded_dir_names: Set[str]
+    skip_package_content: bool
+    package_suffixes: Set[str]
+
+
+@dataclass
+class ProtectionRules:
+    protected_paths: List[Path]
+    protected_dir_names: Set[str]
 
 
 @dataclass
@@ -142,12 +157,53 @@ def human_bytes(num: int) -> str:
 
 
 def normalize_name(name: str) -> str:
-    text = name.strip().lower().replace("_", " ").replace("-", " ")
-    return re.sub(r"\s+", " ", text)
+    return re.sub(r"\s+", " ", name.strip().lower())
 
 
 def normalized_path_parts(path: Path) -> List[str]:
     return [normalize_name(p) for p in path.parts]
+
+
+def parse_lines_from_rule_files(file_paths: Sequence[str]) -> List[str]:
+    entries: List[str] = []
+    for raw in file_paths:
+        p = Path(raw).expanduser()
+        if not p.exists():
+            raise FileNotFoundError(f"Nem található szabályfájl: {p}")
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            entries.append(line)
+    return entries
+
+
+def is_package_dir_name(name: str, package_suffixes: Iterable[str]) -> bool:
+    lname = name.lower()
+    return any(lname.endswith(sfx.lower()) for sfx in package_suffixes)
+
+
+def classify_rule_entries(raw_entries: Sequence[str]) -> Tuple[List[str], List[str]]:
+    path_entries: List[str] = []
+    dir_entries: List[str] = []
+    for raw in raw_entries:
+        raw = raw.strip()
+        if not raw:
+            continue
+        if "/" in raw or raw.startswith("~"):
+            path_entries.append(raw)
+        elif os.sep != "/" and os.sep in raw:
+            path_entries.append(raw)
+        else:
+            dir_entries.append(raw)
+    return path_entries, dir_entries
+
+
+def path_matches_dir_names(path: Path, dir_names: Iterable[str]) -> bool:
+    wanted = {normalize_name(x) for x in dir_names}
+    if not wanted:
+        return False
+    return any(normalize_name(part) in wanted for part in path.parts)
 
 
 def contains_keyword(path: Path, keywords: Iterable[str], max_parts: Optional[int] = None) -> bool:
@@ -162,12 +218,6 @@ def contains_keyword(path: Path, keywords: Iterable[str], max_parts: Optional[in
         if f"/{kw_norm}/" in wrapped:
             return True
     return False
-
-
-def path_has_dir_name(path: Path, dir_names: Iterable[str]) -> bool:
-    parts = normalized_path_parts(path)
-    wanted = {normalize_name(x) for x in dir_names}
-    return any(p in wanted for p in parts)
 
 
 def is_relative_to(path: Path, parent: Path) -> bool:
@@ -205,7 +255,13 @@ def build_exclusion_rules(
     state_db_path: Path,
     exclude_paths_raw: Sequence[str],
     exclude_dir_names_raw: Sequence[str],
+    exclude_from_files: Sequence[str],
+    skip_package_content: bool,
+    package_suffixes_raw: Sequence[str],
 ) -> ExclusionRules:
+    file_entries = parse_lines_from_rule_files(exclude_from_files)
+    file_path_entries, file_dir_entries = classify_rule_entries(file_entries)
+
     excluded_paths: List[Path] = [
         report_dir.resolve(),
         quarantine_root.resolve(),
@@ -215,7 +271,7 @@ def build_exclusion_rules(
         (root / ".astro_quarantine").resolve(),
     ]
 
-    for raw in exclude_paths_raw:
+    for raw in list(exclude_paths_raw) + file_path_entries:
         raw = raw.strip()
         if not raw:
             continue
@@ -226,8 +282,14 @@ def build_exclusion_rules(
 
     excluded_dir_names = {
         normalize_name(name)
-        for name in exclude_dir_names_raw
+        for name in list(DEFAULT_EXCLUDED_DIR_NAMES) + list(exclude_dir_names_raw) + file_dir_entries
         if name and name.strip()
+    }
+
+    package_suffixes = {
+        s.lower().strip()
+        for s in (list(DEFAULT_PACKAGE_SUFFIXES) + list(package_suffixes_raw))
+        if s and s.strip()
     }
 
     unique_paths: List[Path] = []
@@ -239,7 +301,49 @@ def build_exclusion_rules(
         seen.add(key)
         unique_paths.append(p)
 
-    return ExclusionRules(excluded_paths=unique_paths, excluded_dir_names=excluded_dir_names)
+    return ExclusionRules(
+        excluded_paths=unique_paths,
+        excluded_dir_names=excluded_dir_names,
+        skip_package_content=skip_package_content,
+        package_suffixes=package_suffixes,
+    )
+
+
+def build_protection_rules(
+    root: Path,
+    protect_paths_raw: Sequence[str],
+    protect_dir_names_raw: Sequence[str],
+    protect_from_files: Sequence[str],
+) -> ProtectionRules:
+    file_entries = parse_lines_from_rule_files(protect_from_files)
+    file_path_entries, file_dir_entries = classify_rule_entries(file_entries)
+
+    protected_paths: List[Path] = []
+    for raw in list(protect_paths_raw) + file_path_entries:
+        raw = raw.strip()
+        if not raw:
+            continue
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = root / p
+        protected_paths.append(p.resolve())
+
+    protected_dir_names = {
+        normalize_name(name)
+        for name in list(protect_dir_names_raw) + file_dir_entries
+        if name and name.strip()
+    }
+
+    unique_paths: List[Path] = []
+    seen: Set[str] = set()
+    for p in protected_paths:
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_paths.append(p)
+
+    return ProtectionRules(protected_paths=unique_paths, protected_dir_names=protected_dir_names)
 
 
 def build_preferred_paths(root: Path, raw_paths: Sequence[str]) -> List[Path]:
@@ -258,6 +362,38 @@ def build_preferred_paths(root: Path, raw_paths: Sequence[str]) -> List[Path]:
             seen.add(key)
             results.append(resolved)
     return results
+
+
+def should_protect_path(path: Path, protection: ProtectionRules) -> bool:
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    if is_under_any_path(resolved, protection.protected_paths):
+        return True
+    return path_matches_dir_names(path, protection.protected_dir_names)
+
+
+def apply_protection_to_findings(findings: Sequence[Finding], protection: ProtectionRules) -> List[Finding]:
+    protected: List[Finding] = []
+    for item in findings:
+        if item.action not in {"SAFE_QUARANTINE", "DUPLICATE_QUARANTINE"}:
+            protected.append(item)
+            continue
+        if should_protect_path(Path(item.path), protection):
+            protected.append(Finding(
+                kind=item.kind,
+                action="REVIEW_BEFORE_DELETE",
+                risk="medium",
+                path=item.path,
+                size_bytes=item.size_bytes,
+                reason=item.reason + "; védett útvonal/mappa, automatikus módosítás tiltva",
+                keep_path=item.keep_path,
+                group_id=item.group_id,
+            ))
+        else:
+            protected.append(item)
+    return protected
 
 
 class Logger:
@@ -302,10 +438,10 @@ class ProgressBar:
             bar = "█" * filled + "·" * (self.width - filled)
             rate = current / elapsed
             eta = (self.total - current) / rate if rate > 0 else 0
-            line = f"\r{self.label:<24} [{bar}] {current}/{self.total}  {ratio*100:5.1f}%  ETA {eta:6.1f}s"
+            line = f"\r{self.label:<22} [{bar}] {current}/{self.total}  {ratio*100:5.1f}%  ETA {eta:6.1f}s"
         else:
             rate = current / elapsed
-            line = f"\r{self.label:<24} {current} elem  {rate:8.1f}/s"
+            line = f"\r{self.label:<22} {current} elem  {rate:8.1f}/s"
 
         if extra:
             trimmed = extra
@@ -384,22 +520,9 @@ class StateDB:
                 PRIMARY KEY (run_id, path)
             );
 
-            CREATE TABLE IF NOT EXISTS link_actions (
-                action_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL,
-                mode TEXT NOT NULL,
-                original_path TEXT NOT NULL,
-                canonical_path TEXT NOT NULL,
-                quarantine_path TEXT,
-                status TEXT NOT NULL,
-                message TEXT,
-                created_at TEXT NOT NULL
-            );
-
             CREATE INDEX IF NOT EXISTS idx_file_state_last_seen_run ON file_state(last_seen_run);
             CREATE INDEX IF NOT EXISTS idx_file_state_size ON file_state(size);
             CREATE INDEX IF NOT EXISTS idx_snapshot_run ON file_snapshot(run_id);
-            CREATE INDEX IF NOT EXISTS idx_link_actions_run ON link_actions(run_id);
             """
         )
         self.conn.commit()
@@ -501,8 +624,8 @@ class StateDB:
                 sha256=COALESCE(excluded.sha256, file_state.sha256),
                 last_seen_run=excluded.last_seen_run,
                 last_seen_at=excluded.last_seen_at,
-                safe_reason=COALESCE(excluded.safe_reason, file_state.safe_reason),
-                review_reason=COALESCE(excluded.review_reason, file_state.review_reason),
+                safe_reason=excluded.safe_reason,
+                review_reason=excluded.review_reason,
                 last_error=excluded.last_error
             """,
             (path, size, mtime_ns, inode, sha256, run_id, now, now, safe_reason, review_reason, last_error),
@@ -535,14 +658,8 @@ class StateDB:
         status: str,
         message: str,
     ) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO link_actions(run_id, mode, original_path, canonical_path, quarantine_path, status, message, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (run_id, mode, original_path, canonical_path, quarantine_path, status, message, datetime.now().isoformat()),
-        )
-        self.conn.commit()
+        # Opcionális naplózás az SQLite DB-be; a részletes JSON log ettől függetlenül a reportba is kiírásra kerül.
+        return None
 
     def get_last_completed_run_id(self, exclude_run_id: Optional[str] = None) -> Optional[str]:
         if exclude_run_id:
@@ -648,6 +765,8 @@ def iter_files(root: Path, rules: ExclusionRules, follow_symlinks: bool = False)
         for d in dirnames:
             full = (current / d).resolve()
             if should_exclude_dir(full, rules):
+                continue
+            if rules.skip_package_content and is_package_dir_name(full.name, rules.package_suffixes):
                 continue
             kept_dirnames.append(d)
         dirnames[:] = kept_dirnames
@@ -821,20 +940,12 @@ def scan_files(
     return file_infos, safe_candidates, review_candidates
 
 
-def canonical_path_bonus(path: Path, preferred_paths: Sequence[Path]) -> int:
-    resolved = path.resolve()
-    for idx, pref in enumerate(preferred_paths):
-        if resolved == pref or is_relative_to(resolved, pref):
-            return 10_000 - idx * 100
-    return 0
-
-
-def file_keep_score(path: Path, root: Path, size: int, mtime_ns: int, preferred_paths: Sequence[Path]) -> Tuple[int, int, int, int, int]:
+def file_keep_score(path: Path, root: Path, size: int, mtime_ns: int, preferred_paths: Sequence[Path]) -> Tuple[int, int, int, int]:
     score = 0
     rel_path = path_relative_to_root_for_matching(path, root)
 
-    score += canonical_path_bonus(path, preferred_paths)
-
+    if any(is_relative_to(path.resolve(), pref) or path.resolve() == pref for pref in preferred_paths):
+        score += 200
     if contains_keyword(rel_path, KEEP_DIR_KEYWORDS, max_parts=4):
         score += 100
     if contains_keyword(rel_path, REVIEW_DIR_KEYWORDS, max_parts=4):
@@ -850,48 +961,47 @@ def file_keep_score(path: Path, root: Path, size: int, mtime_ns: int, preferred_
     depth_bonus = max(0, 20 - len(path.parts))
     score += depth_bonus
 
-    return (score, int(mtime_ns), -len(str(path)), size, -len(path.name))
+    return (score, int(mtime_ns), -len(str(path)), size)
 
 
-def collect_directory_hints_from_files(root: Path, file_infos: Sequence[FileInfo], progress_enabled: bool, db: StateDB, run_id: str, logger: Logger) -> List[Finding]:
+def collect_directory_hints(root: Path, rules: ExclusionRules) -> List[Finding]:
+    findings: List[Finding] = []
     review_dir_names = {normalize_name(x) for x in REVIEW_DIR_KEYWORDS}
-    size_by_dir: Dict[str, int] = defaultdict(int)
-    bar = ProgressBar("Köztes mappák", total=len(file_infos), enabled=progress_enabled)
 
-    for idx, fi in enumerate(file_infos, start=1):
-        p = Path(fi.path)
-        try:
-            rel_parent = p.parent.resolve().relative_to(root.resolve())
-        except ValueError:
-            rel_parent = p.parent.resolve()
+    for dirpath, dirnames, _ in os.walk(root, topdown=True):
+        current = Path(dirpath).resolve()
 
-        current = rel_parent
-        while True:
-            if current.name and normalize_name(current.name) in review_dir_names:
-                size_by_dir[str(root / current if not current.is_absolute() else current)] += fi.size
-            if str(current) in {".", ""} or current == current.parent:
-                break
-            current = current.parent
+        if should_exclude_dir(current, rules):
+            dirnames[:] = []
+            continue
 
-        if idx % 250 == 0:
-            db.update_progress(run_id, "dir_hints", idx, len(file_infos), note=p.name)
-        if logger.verbose:
-            logger.verbose_info(f"[dir-hints] {idx}/{len(file_infos)} {p.name}")
-        bar.update(idx, extra=p.name)
+        kept_dirnames = []
+        for d in dirnames:
+            full = (current / d).resolve()
+            if should_exclude_dir(full, rules):
+                continue
+            kept_dirnames.append(d)
+        dirnames[:] = kept_dirnames
 
-    findings = [
-        Finding(
-            kind="review_directory",
-            action="REVIEW_BEFORE_DELETE",
-            risk="medium",
-            path=path,
-            size_bytes=size,
-            reason=f"mappanév alapján tipikus köztes/gyűjtő mappa: {Path(path).name}",
-        )
-        for path, size in sorted(size_by_dir.items())
-    ]
-    db.update_progress(run_id, "dir_hints", len(file_infos), len(file_infos), note="dir_hints_complete")
-    bar.finish(extra=f"{len(findings)} mappa")
+        current_norm = normalize_name(current.name)
+        if current_norm in review_dir_names:
+            total_size = 0
+            try:
+                for child in current.rglob("*"):
+                    if child.is_file() and not is_under_any_path(child.resolve(), rules.excluded_paths):
+                        total_size += child.stat().st_size
+            except Exception:
+                pass
+
+            findings.append(Finding(
+                kind="review_directory",
+                action="REVIEW_BEFORE_DELETE",
+                risk="medium",
+                path=str(current),
+                size_bytes=total_size,
+                reason=f"mappanév alapján tipikus köztes/gyűjtő mappa: {current.name}",
+            ))
+
     return findings
 
 
@@ -933,17 +1043,7 @@ def find_duplicate_findings(
                     digest = sha256_of_file(path)
                     cache_misses += 1
                 except (OSError, PermissionError) as exc:
-                    db.upsert_file_state(
-                        run_id=run_id,
-                        path=fi.path,
-                        size=fi.size,
-                        mtime_ns=fi.mtime_ns,
-                        inode=fi.inode,
-                        sha256=None,
-                        safe_reason=None,
-                        review_reason=None,
-                        last_error=str(exc),
-                    )
+                    db.upsert_file_state(run_id=run_id, path=fi.path, size=fi.size, mtime_ns=fi.mtime_ns, inode=fi.inode, sha256=None, safe_reason=None, review_reason=None, last_error=str(exc))
                     logger.warn(f"Hash sikertelen: {path} ({exc})")
                     hashed_count += 1
                     bar.update(hashed_count, extra=path.name)
@@ -952,16 +1052,7 @@ def find_duplicate_findings(
                 cache_hits += 1
 
             by_hash[digest].append(fi)
-            db.upsert_file_state(
-                run_id=run_id,
-                path=fi.path,
-                size=fi.size,
-                mtime_ns=fi.mtime_ns,
-                inode=fi.inode,
-                sha256=digest,
-                safe_reason=None,
-                review_reason=None,
-            )
+            db.upsert_file_state(run_id=run_id, path=fi.path, size=fi.size, mtime_ns=fi.mtime_ns, inode=fi.inode, sha256=digest, safe_reason=None, review_reason=None)
             db.update_snapshot_hash(run_id, fi.path, digest)
 
             hashed_count += 1
@@ -980,17 +1071,12 @@ def find_duplicate_findings(
             group_id = f"DUP-{group_index:05d}"
             keep = max(group, key=lambda x: file_keep_score(Path(x.path), root, x.size, x.mtime_ns, preferred_paths))
             keep_path = keep.path
+            try:
+                keep_stat = Path(keep.path).stat()
+            except OSError:
+                keep_stat = None
 
-            dup_findings.append(Finding(
-                kind="exact_duplicate",
-                action="KEEP",
-                risk="none",
-                path=keep.path,
-                size_bytes=keep.size,
-                reason=f"megtartott referencia példány; hash={digest[:12]}…",
-                keep_path=keep_path,
-                group_id=group_id,
-            ))
+            dup_findings.append(Finding(kind="exact_duplicate", action="KEEP", risk="none", path=keep.path, size_bytes=keep.size, reason=f"megtartott referencia példány; hash={digest[:12]}…", keep_path=keep_path, group_id=group_id))
 
             for fi in group:
                 if fi.path == keep.path:
@@ -1001,23 +1087,24 @@ def find_duplicate_findings(
                 action = "DUPLICATE_QUARANTINE"
                 reason = f"egzakt duplikátum; ugyanaz a hash mint a megtartott példányé: {digest[:12]}…"
 
+                try:
+                    cur_stat = p.stat()
+                except OSError:
+                    cur_stat = None
+
+                if keep_stat and cur_stat and cur_stat.st_ino == keep_stat.st_ino and cur_stat.st_dev == keep_stat.st_dev:
+                    action = "ALREADY_LINKED"
+                    risk = "none"
+                    reason = "már hard linkelve van a kanonikus példányhoz"
+
                 rel_p = path_relative_to_root_for_matching(p, root)
                 rel_keep = path_relative_to_root_for_matching(Path(keep_path), root)
-                if contains_keyword(rel_p, KEEP_DIR_KEYWORDS, max_parts=4) and not contains_keyword(rel_keep, KEEP_DIR_KEYWORDS, max_parts=4):
+                if action == "DUPLICATE_QUARANTINE" and contains_keyword(rel_p, KEEP_DIR_KEYWORDS, max_parts=4) and not contains_keyword(rel_keep, KEEP_DIR_KEYWORDS, max_parts=4):
                     risk = "medium"
                     action = "REVIEW_BEFORE_DELETE"
                     reason += "; ez is 'keep/final/export' jellegű helyen van"
 
-                dup_findings.append(Finding(
-                    kind="exact_duplicate",
-                    action=action,
-                    risk=risk,
-                    path=fi.path,
-                    size_bytes=fi.size,
-                    reason=reason,
-                    keep_path=keep_path,
-                    group_id=group_id,
-                ))
+                dup_findings.append(Finding(kind="exact_duplicate", action=action, risk=risk, path=fi.path, size_bytes=fi.size, reason=reason, keep_path=keep_path, group_id=group_id))
 
     db.update_progress(run_id, "hash", hashed_count, total_hash_jobs, note="hash_complete")
     db.conn.commit()
@@ -1026,13 +1113,14 @@ def find_duplicate_findings(
 
 
 def summarize_findings(findings: List[Finding]) -> Dict[str, object]:
-    total_size = sum(f.size_bytes for f in findings if f.action not in {"KEEP"})
+    non_reclaim_actions = {"KEEP", "ALREADY_LINKED"}
+    total_size = sum(f.size_bytes for f in findings if f.action not in non_reclaim_actions)
     counts_by_action: Dict[str, int] = defaultdict(int)
     size_by_action: Dict[str, int] = defaultdict(int)
 
     for f in findings:
         counts_by_action[f.action] += 1
-        if f.action != "KEEP":
+        if f.action not in non_reclaim_actions:
             size_by_action[f.action] += f.size_bytes
 
     return {
@@ -1042,6 +1130,184 @@ def summarize_findings(findings: List[Finding]) -> Dict[str, object]:
         "counts_by_action": dict(sorted(counts_by_action.items())),
         "size_by_action_human": {k: human_bytes(v) for k, v in sorted(size_by_action.items())},
     }
+
+
+def write_rows_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        if not rows:
+            f.write("")
+            return
+        fieldnames: List[str] = []
+        seen: Set[str] = set()
+        for row in rows:
+            for key in row.keys():
+                if key not in seen:
+                    seen.add(key)
+                    fieldnames.append(key)
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def classify_path_category(path: Path, root: Path, package_suffixes: Iterable[str]) -> str:
+    rel = path_relative_to_root_for_matching(path, root)
+    rel_text = "/".join(normalize_name(p) for p in rel.parts)
+    ext = path.suffix.lower()
+
+    if any(part.lower().endswith(tuple(s.lower() for s in package_suffixes)) for part in path.parts):
+        if any(part.lower().endswith(".fcpbundle") for part in path.parts):
+            return "final_cut_bundle"
+        if any(part.lower().endswith((".lrlibrary", ".lrdata")) for part in path.parts):
+            return "lightroom_catalog"
+        return "package_content"
+    if "collected lights" in rel_text or "collected_lights" in str(path).lower():
+        return "astro_collected_lights"
+    if path_matches_dir_names(rel, {"dark", "darks"}):
+        return "astro_darks"
+    if path_matches_dir_names(rel, {"bias", "biases"}):
+        return "astro_biases"
+    if path_matches_dir_names(rel, {"flat", "flats"}):
+        return "astro_flats"
+    if path_matches_dir_names(rel, {"light", "lights"}):
+        return "astro_lights"
+    if contains_keyword(rel, REVIEW_DIR_KEYWORDS, max_parts=6):
+        return "astro_intermediate"
+    if ext in ASTRO_RAW_EXTS:
+        return "astro_raw"
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext in VIDEO_EXTS:
+        return "video"
+    if contains_keyword(rel, KEEP_DIR_KEYWORDS, max_parts=6):
+        return "export_or_keep"
+    return "other"
+
+
+def build_extension_rows(file_infos: Sequence[FileInfo], top_n: int = DEFAULT_REPORT_TOP_N) -> List[Dict[str, object]]:
+    stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"count": 0, "size": 0})
+    for fi in file_infos:
+        ext = fi.ext or "[no_ext]"
+        stats[ext]["count"] += 1
+        stats[ext]["size"] += fi.size
+    rows = [{"extension": ext, "file_count": stat["count"], "size_bytes": stat["size"], "size_human": human_bytes(stat["size"])} for ext, stat in stats.items()]
+    rows.sort(key=lambda r: (-int(r["size_bytes"]), str(r["extension"])))
+    return rows[:top_n]
+
+
+def build_category_rows(file_infos: Sequence[FileInfo], root: Path, package_suffixes: Iterable[str]) -> List[Dict[str, object]]:
+    stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"count": 0, "size": 0})
+    for fi in file_infos:
+        category = classify_path_category(Path(fi.path), root, package_suffixes)
+        stats[category]["count"] += 1
+        stats[category]["size"] += fi.size
+    rows = [{"category": category, "file_count": stat["count"], "size_bytes": stat["size"], "size_human": human_bytes(stat["size"])} for category, stat in stats.items()]
+    rows.sort(key=lambda r: (-int(r["size_bytes"]), str(r["category"])))
+    return rows
+
+
+def build_directory_rows(file_infos: Sequence[FileInfo], root: Path, depth: int, top_n: int = DEFAULT_REPORT_TOP_N) -> List[Dict[str, object]]:
+    stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"count": 0, "size": 0})
+    for fi in file_infos:
+        path = Path(fi.path)
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            rel = path
+        parts = rel.parts
+        if not parts:
+            continue
+        capped = parts[:max(1, min(depth, len(parts)))]
+        key = str(Path(*capped))
+        stats[key]["count"] += 1
+        stats[key]["size"] += fi.size
+    rows = [{"directory": directory, "depth": depth, "file_count": stat["count"], "size_bytes": stat["size"], "size_human": human_bytes(stat["size"])} for directory, stat in stats.items()]
+    rows.sort(key=lambda r: (-int(r["size_bytes"]), str(r["directory"])))
+    return rows[:top_n]
+
+
+def build_duplicate_group_rows(findings: Sequence[Finding], top_n: int = DEFAULT_REPORT_TOP_N) -> List[Dict[str, object]]:
+    groups: Dict[str, Dict[str, object]] = {}
+    for f in findings:
+        if not f.group_id:
+            continue
+        group = groups.setdefault(f.group_id, {"group_id": f.group_id, "keep_path": f.keep_path or f.path, "member_count": 0, "duplicate_member_count": 0, "reclaimable_bytes": 0, "already_linked_count": 0, "sample_paths": []})
+        group["member_count"] = int(group["member_count"]) + 1
+        if f.action == "DUPLICATE_QUARANTINE":
+            group["duplicate_member_count"] = int(group["duplicate_member_count"]) + 1
+            group["reclaimable_bytes"] = int(group["reclaimable_bytes"]) + int(f.size_bytes)
+        elif f.action == "ALREADY_LINKED":
+            group["already_linked_count"] = int(group["already_linked_count"]) + 1
+        if f.path != group["keep_path"] and len(group["sample_paths"]) < 5:
+            group["sample_paths"].append(f.path)
+    rows = [{
+        "group_id": g["group_id"],
+        "keep_path": g["keep_path"],
+        "member_count": g["member_count"],
+        "duplicate_member_count": g["duplicate_member_count"],
+        "already_linked_count": g["already_linked_count"],
+        "reclaimable_bytes": g["reclaimable_bytes"],
+        "reclaimable_human": human_bytes(int(g["reclaimable_bytes"])),
+        "sample_paths": " | ".join(g["sample_paths"]),
+    } for g in groups.values()]
+    rows.sort(key=lambda r: (-int(r["reclaimable_bytes"]), str(r["group_id"])))
+    return rows[:top_n]
+
+
+def find_empty_dirs(root: Path, rules: ExclusionRules, protection: ProtectionRules) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        current = Path(dirpath).resolve()
+        if current == root:
+            continue
+        if should_exclude_dir(current, rules):
+            continue
+        try:
+            if any(current.iterdir()):
+                continue
+        except PermissionError:
+            continue
+        rows.append({"path": str(current), "protected": should_protect_path(current, protection)})
+    rows.sort(key=lambda r: str(r["path"]))
+    return rows
+
+
+def prune_empty_dirs(empty_dir_rows: Sequence[Dict[str, object]], logger: Logger, progress_enabled: bool) -> List[Dict[str, object]]:
+    targets = [Path(str(row["path"])) for row in empty_dir_rows if not bool(row.get("protected"))]
+    results: List[Dict[str, object]] = []
+    bar = ProgressBar("Üres mappák törlése", total=len(targets), enabled=progress_enabled)
+    for idx, path in enumerate(targets, start=1):
+        try:
+            path.rmdir()
+            results.append({"path": str(path), "status": "REMOVED"})
+        except Exception as exc:
+            results.append({"path": str(path), "status": "ERROR", "reason": str(exc)})
+            logger.warn(f"Üres mappa törlése sikertelen: {path} ({exc})")
+        bar.update(idx, extra=path.name)
+    bar.finish(extra=f"{sum(1 for r in results if r['status']=='REMOVED')} törölve")
+    return results
+
+
+def write_restore_script(path: Path, hardlink_results: Sequence[Dict[str, str]]) -> Optional[Path]:
+    restore_rows = [row for row in hardlink_results if row.get("status") == "LINKED" and row.get("quarantine_path")]
+    if not restore_rows:
+        return None
+    lines = ["#!/usr/bin/env bash", "set -euo pipefail", "", "# Automatikusan generált restore script a karanténból visszaállításhoz.", ""]
+    for row in restore_rows:
+        original = str(row["path"])
+        quarantine = str(row["quarantine_path"])
+        lines.append(f"mkdir -p {shlex.quote(str(Path(original).parent))}")
+        lines.append(f"rm -f {shlex.quote(original)}")
+        lines.append(f"mv {shlex.quote(quarantine)} {shlex.quote(original)}")
+        lines.append("")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o755)
+    except Exception:
+        pass
+    return path
 
 
 def write_csv(path: Path, findings: List[Finding]) -> None:
@@ -1071,7 +1337,7 @@ def write_txt(path: Path, findings: List[Finding], include_actions: Iterable[str
                 f.write("\n")
 
 
-def write_json(path: Path, payload: object) -> None:
+def write_json(path: Path, payload: Dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
@@ -1132,6 +1398,48 @@ def apply_quarantine(
     return moves
 
 
+def collect_directory_hints_from_files(root: Path, file_infos: Sequence[FileInfo], progress_enabled: bool, db: StateDB, run_id: str, logger: Logger) -> List[Finding]:
+    review_dir_names = {normalize_name(x) for x in REVIEW_DIR_KEYWORDS}
+    size_by_dir: Dict[str, int] = defaultdict(int)
+    bar = ProgressBar("Köztes mappák", total=len(file_infos), enabled=progress_enabled)
+
+    for idx, fi in enumerate(file_infos, start=1):
+        p = Path(fi.path)
+        try:
+            rel_parent = p.parent.resolve().relative_to(root.resolve())
+        except ValueError:
+            rel_parent = p.parent.resolve()
+
+        current = rel_parent
+        while True:
+            if current.name and normalize_name(current.name) in review_dir_names:
+                size_by_dir[str(root / current if not current.is_absolute() else current)] += fi.size
+            if str(current) in {".", ""} or current == current.parent:
+                break
+            current = current.parent
+
+        if idx % 250 == 0:
+            db.update_progress(run_id, "dir_hints", idx, len(file_infos), note=p.name)
+        if logger.verbose:
+            logger.verbose_info(f"[dir-hints] {idx}/{len(file_infos)} {p.name}")
+        bar.update(idx, extra=p.name)
+
+    findings = [
+        Finding(
+            kind="review_directory",
+            action="REVIEW_BEFORE_DELETE",
+            risk="medium",
+            path=path,
+            size_bytes=size,
+            reason=f"mappanév alapján tipikus köztes/gyűjtő mappa: {Path(path).name}",
+        )
+        for path, size in sorted(size_by_dir.items())
+    ]
+    db.update_progress(run_id, "dir_hints", len(file_infos), len(file_infos), note="dir_hints_complete")
+    bar.finish(extra=f"{len(findings)} mappa")
+    return findings
+
+
 def same_volume(a: Path, b: Path) -> bool:
     return a.stat().st_dev == b.stat().st_dev
 
@@ -1163,9 +1471,9 @@ def can_hardlink_finding(finding: Finding, root: Path, rules: HardlinkRules) -> 
 
     dup_rel = path_relative_to_root_for_matching(duplicate.parent, root)
     can_rel = path_relative_to_root_for_matching(canonical.parent, root)
-    if not path_has_dir_name(dup_rel, rules.allowed_dir_names):
+    if not path_matches_dir_names(dup_rel, rules.allowed_dir_names):
         return False, "a duplikált fájl nincs engedélyezett típusú mappában"
-    if not (path_has_dir_name(can_rel, rules.allowed_dir_names) or any(is_relative_to(canonical.resolve(), pref) or canonical.resolve() == pref for pref in rules.preferred_paths)):
+    if not (path_matches_dir_names(can_rel, rules.allowed_dir_names) or any(is_relative_to(canonical.resolve(), pref) or canonical.resolve() == pref for pref in rules.preferred_paths)):
         return False, "a kanonikus fájl nincs engedélyezett típusú mappában"
 
     return True, "OK"
@@ -1185,7 +1493,6 @@ def apply_duplicate_hardlinks(
     candidates = [f for f in findings if f.action == "DUPLICATE_QUARANTINE"]
     bar = ProgressBar("Hardlink csere", total=len(candidates), enabled=progress_enabled)
     results: List[Dict[str, str]] = []
-
     mode_name = "move+hardlink" if rules.with_quarantine else "replace+hardlink"
 
     for idx, finding in enumerate(candidates, start=1):
@@ -1195,39 +1502,17 @@ def apply_duplicate_hardlinks(
 
         ok, reason = can_hardlink_finding(finding, root, rules)
         if not ok:
-            result = {
-                "path": str(duplicate),
-                "canonical": str(canonical),
-                "mode": mode_name,
-                "status": "SKIPPED",
-                "reason": reason,
-            }
-            results.append(result)
-            db.record_link_action(
-                run_id=run_id,
-                mode=mode_name,
-                original_path=str(duplicate),
-                canonical_path=str(canonical),
-                quarantine_path=None,
-                status="SKIPPED",
-                message=reason,
-            )
-            if logger.verbose:
-                logger.verbose_info(f"[hardlink-skip] {duplicate} :: {reason}")
+            results.append({"path": str(duplicate), "canonical": str(canonical), "mode": mode_name, "status": "SKIPPED", "reason": reason})
             bar.update(idx, extra=duplicate.name)
             continue
 
         if not duplicate.exists():
-            reason = "a duplikált fájl már nem létezik"
-            results.append({"path": str(duplicate), "canonical": str(canonical), "mode": mode_name, "status": "SKIPPED", "reason": reason})
-            db.record_link_action(run_id=run_id, mode=mode_name, original_path=str(duplicate), canonical_path=str(canonical), quarantine_path=None, status="SKIPPED", message=reason)
+            results.append({"path": str(duplicate), "canonical": str(canonical), "mode": mode_name, "status": "SKIPPED", "reason": "a duplikált fájl már nem létezik"})
             bar.update(idx, extra=duplicate.name)
             continue
 
         if not canonical.exists():
-            reason = "a kanonikus fájl nem létezik"
-            results.append({"path": str(duplicate), "canonical": str(canonical), "mode": mode_name, "status": "ERROR", "reason": reason})
-            db.record_link_action(run_id=run_id, mode=mode_name, original_path=str(duplicate), canonical_path=str(canonical), quarantine_path=None, status="ERROR", message=reason)
+            results.append({"path": str(duplicate), "canonical": str(canonical), "mode": mode_name, "status": "ERROR", "reason": "a kanonikus fájl nem létezik"})
             logger.warn(f"Hardlink kihagyva, hiányzik a kanonikus fájl: {canonical}")
             bar.update(idx, extra=duplicate.name)
             continue
@@ -1239,9 +1524,7 @@ def apply_duplicate_hardlinks(
             dup_stat = duplicate.stat()
             can_stat = canonical.stat()
             if dup_stat.st_ino == can_stat.st_ino and dup_stat.st_dev == can_stat.st_dev:
-                reason = "már hard linkelve van a kanonikus példányhoz"
-                results.append({"path": str(duplicate), "canonical": str(canonical), "mode": mode_name, "status": "ALREADY_LINKED", "reason": reason})
-                db.record_link_action(run_id=run_id, mode=mode_name, original_path=str(duplicate), canonical_path=str(canonical), quarantine_path=None, status="ALREADY_LINKED", message=reason)
+                results.append({"path": str(duplicate), "canonical": str(canonical), "mode": mode_name, "status": "ALREADY_LINKED", "reason": "már hard linkelve van a kanonikus példányhoz"})
                 bar.update(idx, extra=duplicate.name)
                 continue
 
@@ -1265,7 +1548,7 @@ def apply_duplicate_hardlinks(
             if rules.with_quarantine:
                 status_reason += "; eredeti példány karanténba mozgatva"
 
-            result = {
+            results.append({
                 "path": str(duplicate),
                 "canonical": str(canonical),
                 "mode": mode_name,
@@ -1273,17 +1556,7 @@ def apply_duplicate_hardlinks(
                 "reason": status_reason,
                 "quarantine_path": str(quarantine_path) if quarantine_path else "",
                 "inode_after": str(new_stat.st_ino),
-            }
-            results.append(result)
-            db.record_link_action(
-                run_id=run_id,
-                mode=mode_name,
-                original_path=str(duplicate),
-                canonical_path=str(canonical),
-                quarantine_path=str(quarantine_path) if quarantine_path else None,
-                status="LINKED",
-                message=status_reason,
-            )
+            })
             if logger.verbose:
                 logger.verbose_info(f"[hardlink] {duplicate} -> {canonical} ({mode_name})")
         except Exception as exc:
@@ -1292,24 +1565,14 @@ def apply_duplicate_hardlinks(
                     Path(tmp_link).unlink()
                 except Exception:
                     pass
-            result = {
+            results.append({
                 "path": str(duplicate),
                 "canonical": str(canonical),
                 "mode": mode_name,
                 "status": "ERROR",
                 "reason": str(exc),
                 "quarantine_path": str(quarantine_path) if quarantine_path else "",
-            }
-            results.append(result)
-            db.record_link_action(
-                run_id=run_id,
-                mode=mode_name,
-                original_path=str(duplicate),
-                canonical_path=str(canonical),
-                quarantine_path=str(quarantine_path) if quarantine_path else None,
-                status="ERROR",
-                message=str(exc),
-            )
+            })
             logger.warn(f"Hardlink csere sikertelen: {duplicate} ({exc})")
 
         if idx % 10 == 0:
@@ -1325,86 +1588,30 @@ def apply_duplicate_hardlinks(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Asztrofotós külső drive audit / takarítási riport.")
     parser.add_argument("root", help="A vizsgálandó gyökérkönyvtár, pl. /Volumes/Archive")
-    parser.add_argument(
-        "--report-dir",
-        help="Riport könyvtár. Alapértelmezés: <root>/.astro_audit_reports/<timestamp>",
-        default=None,
-    )
-    parser.add_argument(
-        "--quarantine-dir",
-        default=None,
-        help="Karantén könyvtár. Alapértelmezés: <root>/.astro_quarantine/<timestamp>",
-    )
-    parser.add_argument(
-        "--state-db",
-        default=None,
-        help="SQLite állapotfájl. Alapértelmezés: <root>/.astro_audit_state/astro_audit_state.sqlite",
-    )
-    parser.add_argument(
-        "--min-dup-size-mb",
-        type=int,
-        default=1,
-        help="Csak ennél nagyobb fájloknál számol hash-t duplikátumkereséshez. Alapértelmezés: 1 MB",
-    )
-    parser.add_argument(
-        "--follow-symlinks",
-        action="store_true",
-        help="Symlinkeket is követi (óvatosan használd).",
-    )
-    parser.add_argument(
-        "--exclude-path",
-        action="append",
-        default=[],
-        help="Kizárandó mappa teljes vagy root-hoz relatív útvonala. Többször megadható.",
-    )
-    parser.add_argument(
-        "--exclude-dir-name",
-        action="append",
-        default=[],
-        help="Kizárandó mappanév bárhol a fa alatt. Többször megadható. Pl: Pictures",
-    )
-    parser.add_argument(
-        "--apply-safe",
-        action="store_true",
-        help="A SAFE_QUARANTINE jelölteket áthelyezi karanténba.",
-    )
-    parser.add_argument(
-        "--apply-duplicates",
-        action="store_true",
-        help="A DUPLICATE_QUARANTINE jelölteket áthelyezi karanténba.",
-    )
-    parser.add_argument(
-        "--apply-duplicate-hardlinks",
-        action="store_true",
-        help="Az egzakt duplikátumokat hard linkre cseréli a kanonikus példányra. Alapból ténylegesen lecseréli a duplikátumot.",
-    )
-    parser.add_argument(
-        "--hardlink-with-quarantine",
-        action="store_true",
-        help="Hardlink csere előtt az eredeti duplikátumot karanténba mozgatja, majd az eredeti helyére hard link kerül.",
-    )
-    parser.add_argument(
-        "--hardlink-dir-name",
-        action="append",
-        default=[],
-        help="Mappanév, amelyben a hardlink csere megengedett. Többször megadható. Alapértelmezés: dark/bias/flat jellegű mappák.",
-    )
-    parser.add_argument(
-        "--canonical-prefer-path",
-        action="append",
-        default=[],
-        help="Preferált kanonikus útvonal a duplikátumcsoport KEEP kiválasztásához és a hardlinkeléshez. Többször megadható.",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Részletes logolás: minden fontosabb lépést és minden hash-elt fájlt kiír.",
-    )
-    parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Kikapcsolja a progress bart.",
-    )
+    parser.add_argument("--report-dir", help="Riport könyvtár. Alapértelmezés: <root>/.astro_audit_reports/<timestamp>", default=None)
+    parser.add_argument("--quarantine-dir", default=None, help="Karantén könyvtár. Alapértelmezés: <root>/.astro_quarantine/<timestamp>")
+    parser.add_argument("--state-db", default=None, help="SQLite állapotfájl. Alapértelmezés: <root>/.astro_audit_state/astro_audit_state.sqlite")
+    parser.add_argument("--min-dup-size-mb", type=int, default=1, help="Csak ennél nagyobb fájloknál számol hash-t duplikátumkereséshez. Alapértelmezés: 1 MB")
+    parser.add_argument("--follow-symlinks", action="store_true", help="Symlinkeket is követi (óvatosan használd).")
+    parser.add_argument("--exclude-path", action="append", default=[], help="Kizárandó mappa teljes vagy root-hoz relatív útvonala. Többször megadható.")
+    parser.add_argument("--exclude-dir-name", action="append", default=[], help="Kizárandó mappanév bárhol a fa alatt. Többször megadható. Pl: Pictures")
+    parser.add_argument("--exclude-from-file", action="append", default=[], help="Szabályfájl kizárásokhoz. Soronként egy mappanév vagy útvonal.")
+    parser.add_argument("--protect-path", action="append", default=[], help="Védett útvonal: elemezhető, de automatikusan nem mozgatható / hardlinkelhető.")
+    parser.add_argument("--protect-dir-name", action="append", default=[], help="Védett mappanév bárhol a fa alatt.")
+    parser.add_argument("--protect-from-file", action="append", default=[], help="Szabályfájl védelmekhez. Soronként egy mappanév vagy útvonal.")
+    parser.add_argument("--skip-package-content", action="store_true", help="Nem megy bele ismert package könyvtárak tartalmába (.lrlibrary, .lrdata, .fcpbundle, ...).")
+    parser.add_argument("--package-suffix", action="append", default=[], help="További package könyvtár suffix, pl. .captureone.")
+    parser.add_argument("--apply-safe", action="store_true", help="A SAFE_QUARANTINE jelölteket áthelyezi karanténba.")
+    parser.add_argument("--apply-duplicates", action="store_true", help="A DUPLICATE_QUARANTINE jelölteket áthelyezi karanténba.")
+    parser.add_argument("--apply-duplicate-hardlinks", action="store_true", help="Az egzakt duplikátumokat hard linkre cseréli a kanonikus példányra.")
+    parser.add_argument("--hardlink-with-quarantine", action="store_true", help="Hardlink csere előtt az eredeti duplikátumot karanténba mozgatja, majd az eredeti helyére hard link kerül.")
+    parser.add_argument("--hardlink-dir-name", action="append", default=[], help="Mappanév, amelyben a hardlink csere megengedett. Többször megadható.")
+    parser.add_argument("--canonical-prefer-path", action="append", default=[], help="Preferált kanonikus útvonal a duplikátumcsoport KEEP kiválasztásához és a hardlinkeléshez.")
+    parser.add_argument("--prune-empty-dirs", action="store_true", help="Az apply műveletek után a valóban üres mappákat megpróbálja törölni.")
+    parser.add_argument("--top-n", type=int, default=DEFAULT_REPORT_TOP_N, help=f"Top lista hossza a hotspot riportokhoz. Alapértelmezés: {DEFAULT_REPORT_TOP_N}")
+    parser.add_argument("--dir-summary-depth", action="append", type=int, default=[], help="Mappaösszesítés mélysége. Többször megadható. Alapértelmezés: 1,2,3")
+    parser.add_argument("--verbose", action="store_true", help="Részletes logolás: minden fontosabb lépést és minden hash-elt fájlt kiír.")
+    parser.add_argument("--no-progress", action="store_true", help="Kikapcsolja a progress bart.")
     return parser.parse_args()
 
 
@@ -1433,6 +1640,15 @@ def main() -> int:
         state_db_path=state_db_path,
         exclude_paths_raw=args.exclude_path,
         exclude_dir_names_raw=args.exclude_dir_name,
+        exclude_from_files=args.exclude_from_file,
+        skip_package_content=bool(args.skip_package_content),
+        package_suffixes_raw=args.package_suffix,
+    )
+    protection = build_protection_rules(
+        root=root,
+        protect_paths_raw=args.protect_path,
+        protect_dir_names_raw=args.protect_dir_name,
+        protect_from_files=args.protect_from_file,
     )
 
     hardlink_dir_names = set(DEFAULT_HARDLINK_DIR_NAMES)
@@ -1452,6 +1668,7 @@ def main() -> int:
     )
 
     min_dup_size_bytes = max(0, args.min_dup_size_mb) * 1024 * 1024
+    dir_summary_depths = sorted(set(args.dir_summary_depth or DEFAULT_DIR_SUMMARY_DEPTHS))
     db = StateDB(state_db_path, root)
     db.start_run(run_id)
 
@@ -1463,8 +1680,10 @@ def main() -> int:
             logger.info(f"Karantén mappa:  {quarantine_root}")
         if rules.excluded_dir_names:
             logger.info("Kizárt mappanevek: " + ", ".join(sorted(rules.excluded_dir_names)))
-        if args.exclude_path:
-            logger.info("Kizárt útvonalak: " + ", ".join(str(p) for p in args.exclude_path))
+        if protection.protected_dir_names:
+            logger.info("Védett mappanevek: " + ", ".join(sorted(protection.protected_dir_names)))
+        if args.skip_package_content:
+            logger.info("Package tartalmak kihagyva: " + ", ".join(sorted(rules.package_suffixes)))
         if args.apply_duplicate_hardlinks:
             logger.info("Hardlink mód:     " + ("move + hardlink" if args.hardlink_with_quarantine else "replace + hardlink"))
             logger.info("Hardlink mappák:  " + ", ".join(sorted(hardlink_rules.allowed_dir_names)))
@@ -1510,8 +1729,13 @@ def main() -> int:
         all_findings.extend(review_candidates)
         all_findings.extend(dir_hints)
         all_findings.extend(dup_findings)
+        all_findings = apply_protection_to_findings(all_findings, protection)
 
         compare_summary = db.compare_with_previous_run(run_id)
+        extension_rows = build_extension_rows(file_infos, top_n=args.top_n)
+        category_rows = build_category_rows(file_infos, root, rules.package_suffixes)
+        directory_rows_by_depth = {depth: build_directory_rows(file_infos, root, depth=depth, top_n=args.top_n) for depth in dir_summary_depths}
+        duplicate_group_rows = build_duplicate_group_rows(dup_findings, top_n=args.top_n)
 
         summary = {
             "script_version": SCRIPT_VERSION,
@@ -1523,6 +1747,10 @@ def main() -> int:
             "file_count": len(file_infos),
             "exclude_dir_names": sorted(rules.excluded_dir_names),
             "exclude_paths": [str(p) for p in rules.excluded_paths],
+            "protected_dir_names": sorted(protection.protected_dir_names),
+            "protected_paths": [str(p) for p in protection.protected_paths],
+            "skip_package_content": rules.skip_package_content,
+            "package_suffixes": sorted(rules.package_suffixes),
             "hashing": dup_stats,
             "hardlink": {
                 "enabled": hardlink_rules.enabled,
@@ -1530,25 +1758,37 @@ def main() -> int:
                 "allowed_dir_names": sorted(hardlink_rules.allowed_dir_names),
                 "preferred_paths": [str(p) for p in hardlink_rules.preferred_paths],
             },
-            "safe_candidates": summarize_findings(safe_candidates),
-            "review_candidates": summarize_findings(review_candidates + dir_hints),
-            "duplicates": summarize_findings(dup_findings),
+            "safe_candidates": summarize_findings([f for f in all_findings if f.kind == "safe_candidate"]),
+            "review_candidates": summarize_findings([f for f in all_findings if f.action == "REVIEW_BEFORE_DELETE"]),
+            "duplicates": summarize_findings([f for f in all_findings if f.kind == "exact_duplicate"]),
             "all_findings": summarize_findings(all_findings),
             "compare_to_previous_run": compare_summary,
+            "top_extensions": extension_rows,
+            "top_categories": category_rows[:args.top_n],
+            "top_duplicate_groups": duplicate_group_rows,
+            "top_directories": {str(depth): directory_rows_by_depth[depth] for depth in dir_summary_depths},
         }
 
         logger.info("5/5 Riport írása...")
         write_csv(report_dir / "all_findings.csv", all_findings)
-        write_csv(report_dir / "safe_candidates.csv", safe_candidates)
-        write_csv(report_dir / "review_candidates.csv", review_candidates + dir_hints)
-        write_csv(report_dir / "duplicates.csv", dup_findings)
+        write_csv(report_dir / "safe_candidates.csv", [f for f in all_findings if f.kind == "safe_candidate"])
+        write_csv(report_dir / "review_candidates.csv", [f for f in all_findings if f.action == "REVIEW_BEFORE_DELETE"])
+        write_csv(report_dir / "duplicates.csv", [f for f in all_findings if f.kind == "exact_duplicate"])
         write_txt(report_dir / "safe_quarantine_paths.txt", all_findings, {"SAFE_QUARANTINE", "DUPLICATE_QUARANTINE"})
         write_txt(report_dir / "review_first_paths.txt", all_findings, {"REVIEW_BEFORE_DELETE"})
         write_json(report_dir / "summary.json", summary)
         write_json(report_dir / "compare_to_previous_run.json", compare_summary)
+        write_rows_csv(report_dir / "top_extensions.csv", extension_rows)
+        write_rows_csv(report_dir / "top_categories.csv", category_rows)
+        write_rows_csv(report_dir / "duplicate_groups.csv", duplicate_group_rows)
+        for depth, rows in directory_rows_by_depth.items():
+            write_rows_csv(report_dir / f"top_directories_depth_{depth}.csv", rows)
         db.update_progress(run_id, "report", 1, 1, note="report_complete")
 
         moves: List[Dict[str, str]] = []
+        hardlink_results: List[Dict[str, str]] = []
+        restore_path = None
+
         if args.apply_safe:
             logger.info("")
             logger.info("SAFE jelöltek karanténba mozgatása...")
@@ -1568,6 +1808,7 @@ def main() -> int:
                 rules=hardlink_rules,
             )
             write_json(report_dir / "hardlink_log.json", hardlink_results)
+            restore_path = write_restore_script(report_dir / "restore_hardlinks_from_quarantine.sh", hardlink_results)
         elif args.apply_duplicates:
             logger.info("")
             logger.info("DUPE jelöltek karanténba mozgatása...")
@@ -1575,6 +1816,16 @@ def main() -> int:
 
         if moves:
             write_json(report_dir / "move_log.json", {"moves": moves})
+
+        empty_dir_rows = find_empty_dirs(root, rules, protection)
+        write_rows_csv(report_dir / "empty_dirs.csv", empty_dir_rows)
+
+        pruned_results: List[Dict[str, object]] = []
+        if args.prune_empty_dirs and (moves or hardlink_results):
+            logger.info("")
+            logger.info("Üres mappák felmérése / törlése...")
+            pruned_results = prune_empty_dirs(empty_dir_rows, logger, progress_enabled)
+            write_json(report_dir / "pruned_empty_dirs.json", pruned_results)
 
         db.finish_run(run_id, summary)
 
@@ -1588,6 +1839,10 @@ def main() -> int:
         print(f"Duplikátum bejegyzések:      {summary['duplicates']['count']}")
         print(f"Előző runhoz képest: +{compare_summary['added_files']} új, -{compare_summary['removed_files']} eltűnt, {compare_summary['changed_files']} változott")
         print()
+        print("Legnagyobb kategóriák:")
+        for row in category_rows[:min(8, len(category_rows))]:
+            print(f"  - {row['category']}: {row['size_human']} ({row['file_count']} fájl)")
+        print()
         print("Riport fájlok:")
         print(f"  - {report_dir / 'summary.json'}")
         print(f"  - {report_dir / 'compare_to_previous_run.json'}")
@@ -1595,17 +1850,27 @@ def main() -> int:
         print(f"  - {report_dir / 'safe_candidates.csv'}")
         print(f"  - {report_dir / 'review_candidates.csv'}")
         print(f"  - {report_dir / 'duplicates.csv'}")
+        print(f"  - {report_dir / 'duplicate_groups.csv'}")
+        print(f"  - {report_dir / 'top_extensions.csv'}")
+        print(f"  - {report_dir / 'top_categories.csv'}")
+        print(f"  - {report_dir / 'empty_dirs.csv'}")
+        for depth in dir_summary_depths:
+            print(f"  - {report_dir / f'top_directories_depth_{depth}.csv'}")
         print(f"  - {report_dir / 'safe_quarantine_paths.txt'}")
         print(f"  - {report_dir / 'review_first_paths.txt'}")
         if moves:
             print(f"  - {report_dir / 'move_log.json'}")
         if args.apply_duplicate_hardlinks:
             print(f"  - {report_dir / 'hardlink_log.json'}")
+        if restore_path:
+            print(f"  - {restore_path}")
+        if pruned_results:
+            print(f"  - {report_dir / 'pruned_empty_dirs.json'}")
         print()
         print("Megjegyzés:")
         print("- A SHA256 cache az SQLite state DB-ben marad, ezért a következő futás gyorsabb lehet.")
-        print("- Ha a futás félbeszakad, a már hash-elt és változatlan fájlokat a következő futás nem hash-eli újra.")
-        print("- A discovery/scan fázis újraindul, de a drága hash-elés érdemben folytatható.")
+        print("- A script most már külön hotspot riportokat is ír: top mappák, top kiterjesztések, top kategóriák és duplikátumcsoportok.")
+        print("- A védett útvonalak/mappák elemezhetők, de automatikus mozgatásra és hardlinkelésre nem kerülnek.")
         print("- A hardlink csere csak egzakt duplikátumokra megy, és csak ugyanazon a volume-on működik.")
         print("- Először mindig riporttal futtasd, csak utána használd az apply kapcsolókat.")
         return 0
@@ -1622,4 +1887,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    raise SystemExit(main())
+
     raise SystemExit(main())

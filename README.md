@@ -1,91 +1,119 @@
-# Astro drive audit script
+# Astro Drive Audit v4
 
-Ez a script asztrofotós / képes külső drive-ok auditálására és takarítás-előkészítésére készült.
+Ez a verzió már nem csak duplikátumot keres, hanem kifejezetten nagy astro / photo workflow drive-okhoz ad használható riportokat és biztonságosabb takarítási opciókat.
 
-## Fő funkciók
+## Új dolgok ebben a verzióban
 
-- egzakt duplikátumok keresése SHA256 hash alapján
-- Siril / stacking / process / collected_* jellegű köztes fájlok és mappák jelölése
-- safe / review kategóriák szétválasztása
-- progress bar és `--verbose`
-- SQLite state DB a cache-elt hash-ekhez és a futások összehasonlításához
-- opcionális karanténba mozgatás
-- opcionális hard linkes duplikátumcsere
+- védett útvonalak és mappanevek
+    - elemezhetőek, de automatikusan nem mozgatja és nem hardlinkeli őket
+- szabályfájl alapú kizárás és védelem
+    - `--exclude-from-file`
+    - `--protect-from-file`
+- package tartalom kihagyása
+    - pl. `.lrlibrary`, `.lrdata`, `.fcpbundle`
+    - `--skip-package-content`
+- hotspot riportok
+    - top mappák mélységenként
+    - top kiterjesztések
+    - top kategóriák
+    - top duplikátumcsoportok
+- üres mappák riportja és opcionális törlése
+    - `--prune-empty-dirs`
+- inode-aware duplikátum kezelés
+    - a már hardlinkelt példányokat külön kezeli, nem úgy tekinti, mintha még egyszer ugyanannyi helyet lehetne nyerni rajtuk
+- hardlinkes duplikátumcsere továbbra is támogatott
+    - preferált kanonikus útvonalakkal
+    - opcionális karanténos móddal
 
-## Alap futás
+## Különösen hasznos opciók nálad
 
+### Pictures teljes kihagyása
 ```bash
-python3 astro_drive_audit.py /Volumes/Archive
+python3 astro_drive_audit_v4.py /Volumes/Archive --exclude-dir-name Pictures
 ```
 
-## Pictures mappa kizárása
-
+### Pictures elemzése, de automatikus módosítás tiltása
 ```bash
-python3 astro_drive_audit.py /Volumes/Archive --exclude-dir-name Pictures
+python3 astro_drive_audit_v4.py /Volumes/Archive --protect-dir-name Pictures
 ```
 
-## Verbose mód
-
-```bash
-python3 astro_drive_audit.py /Volumes/Archive --verbose
+### Kizárások külön fájlból
+`exclude_rules.txt`
+```txt
+Pictures
+Videos
+Astro/tools
 ```
 
-## Biztosabb találatok karanténba
-
+Futtatás:
 ```bash
-python3 astro_drive_audit.py /Volumes/Archive --apply-safe --apply-duplicates
+python3 astro_drive_audit_v4.py /Volumes/Archive --exclude-from-file exclude_rules.txt
 ```
 
-## Hardlinkes deduplikáció calibration library preferenciával
+### Védett útvonalak külön fájlból
+`protect_rules.txt`
+```txt
+Pictures
+Astro/stacks
+Astro/processed
+```
 
-Ez a mód a KEEP példányt preferált útvonalról választja ki, majd a duplikált fájl helyére hard linket rak.
-
+Futtatás:
 ```bash
-python3 astro_drive_audit.py /Volumes/Archive \
+python3 astro_drive_audit_v4.py /Volumes/Archive --protect-from-file protect_rules.txt
+```
+
+### Package tartalmak kihagyása
+```bash
+python3 astro_drive_audit_v4.py /Volumes/Archive --skip-package-content
+```
+
+### Hardlinkes dedup calibration library preferálással
+```bash
+python3 astro_drive_audit_v4.py /Volumes/Archive \
+  --protect-dir-name Pictures \
   --apply-duplicate-hardlinks \
-  --canonical-prefer-path Astro/calibration_library \
-  --exclude-dir-name Pictures
+  --canonical-prefer-path Astro/calibration_library
 ```
 
-## Hardlink + karantén
-
-Ebben a módban a duplikált külön példány előbb karanténba kerül, majd az eredeti helyére hard link jön vissza.
-
+### Hardlink + karantén
 ```bash
-python3 astro_drive_audit.py /Volumes/Archive \
+python3 astro_drive_audit_v4.py /Volumes/Archive \
+  --protect-dir-name Pictures \
   --apply-duplicate-hardlinks \
   --hardlink-with-quarantine \
   --canonical-prefer-path Astro/calibration_library
 ```
 
-Megjegyzés: ez rendezettebb és biztonságosabb, de a karanténban megmaradó régi példányok miatt nem ad maximális azonnali helynyereséget.
-
-## Hardlinkelhető mappatípusok
-
-Alapértelmezésben ezek engedettek:
-
-- `dark`
-- `darks`
-- `bias`
-- `biases`
-- `flat`
-- `flats`
-
-Bővíthető például így:
-
+### Üres mappák törlése apply után
 ```bash
-python3 astro_drive_audit.py /Volumes/Archive \
+python3 astro_drive_audit_v4.py /Volumes/Archive \
   --apply-duplicate-hardlinks \
   --canonical-prefer-path Astro/calibration_library \
-  --hardlink-dir-name lights \
-  --hardlink-dir-name collected_lights
+  --prune-empty-dirs
 ```
 
-Ezt csak akkor használd, ha biztos vagy benne, hogy ezek a fájlok immutábilisak és semmilyen workflow nem ír vissza beléjük.
+## Főbb riportok
 
-## Fontos
+- `summary.json`
+- `all_findings.csv`
+- `safe_candidates.csv`
+- `review_candidates.csv`
+- `duplicates.csv`
+- `duplicate_groups.csv`
+- `top_extensions.csv`
+- `top_categories.csv`
+- `top_directories_depth_1.csv`
+- `top_directories_depth_2.csv`
+- `top_directories_depth_3.csv`
+- `empty_dirs.csv`
+- `hardlink_log.json` ha volt hardlink csere
+- `restore_hardlinks_from_quarantine.sh` ha karanténos hardlink mód volt és van mit visszaállítani
 
-- a hard link **nem shortcut**, hanem ugyanarra az inode-ra mutató másik név
-- ugyanazon a volume-on működik
-- először mindig riporttal vagy kisebb mintán próbáld ki
-- Lightroom / Final Cut / PixInsight project jellegű fájlokra ne ereszd rá vakon
+## Fontos megjegyzés
+
+- A `--hardlink-with-quarantine` biztonságosabb, de nem ad teljes azonnali helynyereséget, mert a régi példány a karanténban még megmarad.
+- A sima hardlink csere ad valódi deduplikációt.
+- A `protect` nem ugyanaz, mint az `exclude`:
+    - `exclude` = ne is elemezze
+    - `protect` = elemezze, de ne nyúljon hozzá automatikusan
